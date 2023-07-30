@@ -5,7 +5,8 @@
 #define BTN_LED_REG_DDR  DDRA   // Register for data direction of buttons/LEDs
 #define BTN_LED_REG_PORT PORTA  // Register for setting pull-ups/output state of buttons/LEDs
 #define MTR_SNR_REG_DDR  DDRB   // Register for data direction of motor/sensor
-#define MTR_SNR_REG_PORT PORTB  // Register for setting pull-ups/output state of motor/sensoe
+#define MTR_SNR_REG_PORT PORTB  // Register for setting pull-ups/output state of motor/sensor
+#define PC_REG           GPIOR0 // Register for differentiating which port gave a pin-change register
 
 #define BTN_REG_PIN      PINA   // Register for reading state of buttons
 #define BTN_REG_INT      PCMSK0 // Register for button pin-change interrupts
@@ -46,7 +47,8 @@ volatile uint8_t size = 0;
 
 #pragma region Subroutines //////////////////////////////////////////////////
 uint8_t debounce_button() {
-    volatile uint8_t original_btn = BTN_REG_PIN & BTN_MASK;
+    // @TODO: Factor out by passing in pin register
+    uint8_t original_btn = BTN_REG_PIN & BTN_MASK;
 
     // Run timer to debounce
     TCCR0B |= (1 << CS00)  // Clock/1024 (bit 0)
@@ -68,7 +70,26 @@ uint8_t debounce_button() {
 }
 
 uint8_t debounce_sensor() {
-    return 0;
+    uint8_t original_snr = SNR_REG_PIN & (1 << SNR_PIN);
+
+    // Run timer to debounce
+    TCCR0B |= (1 << CS00)  // Clock/1024 (bit 0)
+              | (1 << CS02); // Clock/1024 (bit 2)
+    TIMER_DEBOUNCE_REG_CMP = DEBOUNCE_TIME;                   // Set timer to go off at debounce time
+    TIMER_DEBOUNCE_REG_CNT = 0;                               // Reset timer to 0
+    TIMER_DEBOUNCE_REG_FLG |= (1 << TIMER_DEBOUNCE_INT_FLG);  // Clear existing output compare interrupt
+    TIMER_DEBOUNCE_REG_INT |= (1 << TIMER_DEBOUNCE_INT_MSK);  // Enable output compare interrupt
+
+    // Go to sleep until timer clears
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    sleep_mode();
+
+    // --- SLEEP ---
+
+    uint8_t current_snr = SNR_REG_PIN & (1 << SNR_PIN);
+    return current_snr == original_snr
+        ? (~SNR_REG_PIN & (1 << SNR_PIN))
+        : 0;
 }
 
 void set_size_leds() {
@@ -107,8 +128,19 @@ void set_size_leds() {
 
 #pragma region ISRs /////////////////////////////////////////////////////////
 ISR(PCINT0_vect) { // Button pin-chance ISR
-    // Disable pin-change interrupts on buttons to prevent re-firing
+    // Disable pin-change interrupts to prevent re-firing
     BTN_REG_INT = 0;
+    SNR_REG_INT = 0;
+
+    PC_REG = 0;
+}
+
+ISR(PCINT1_vect) { // Sensor pin-change ISR
+    // Disable pin-change interrupts to prevent re-firing
+    SNR_REG_INT = 0;
+    BTN_REG_INT = 0;
+
+    PC_REG = 1;
 }
 
 ISR(TIM0_COMPA_vect) { // Timer 0 output comparison A ISR
@@ -204,10 +236,11 @@ uint8_t state_armed() {
     TCCR1B = (1 << CS12)    // IO clock/1024 (bit 2)
            | (1 << CS10)    // IO clock/1024 (bit 0)
            | (1 << WGM12);  // Fast PWM 10-bit (bit 2)
-    TCNT1 = 0;
+    TCNT1 = 450; // Initially set the counter close to output compare to shorten delay before
+                 // LED goes on
     OCR1A = 500; // Set output compare to ~500ms to toggle LED at ~50% duty cycle
 
-    const uint8_t btn_ints = (1 << BTN_ARM_INT) /* @TODO TEST CODE */ | (1 << BTN_PURGE_INT);
+    const uint8_t btn_ints = (1 << BTN_ARM_INT);
     const uint8_t snr_ints = (1 << SNR_INT_MSK);
 
     uint8_t result_state = 0;
@@ -223,23 +256,24 @@ uint8_t state_armed() {
         // --- SLEEP ---
 
         // Awoken from sleep by pin change
-        // @TODO: check if sensor went off
-        uint8_t button = debounce_button();
-        if (button == (1 << BTN_ARM_PIN)) {
-            // Turn off armed LED
-            BTN_LED_REG_PORT &= ~(1 << LED_ARMED_PIN);
-            result_state = STATE_SETUP;
-            break;
+        if (PC_REG == 0) {
+            // Button pressed
+            if (debounce_button() == (1 << BTN_ARM_PIN)) {
+                // Turn off armed LED
+                BTN_LED_REG_PORT &= ~(1 << LED_ARMED_PIN);
+                result_state = STATE_SETUP;
+                break;
+            }
+        } else {
+            // Sensor went off
+            if (debounce_sensor() == (1 << SNR_PIN)) {
+                // Turn on armed LED to indicate dispensing is occurring/has occurred
+                BTN_LED_REG_PORT |= (1 << LED_ARMED_PIN);
+                result_state = STATE_DISPENSING;
+                break;
+            }
+            BTN_LED_REG_PORT ^= (1 << LED_SIZE_XL_PIN);
         }
-
-        // @TODO TEST CODE
-        if (button == (1 << BTN_PURGE_PIN)) {
-            // Turn on armed LED to indicate dispensing is occurring/has occurred
-            BTN_LED_REG_PORT |= (1 << LED_ARMED_PIN);
-            result_state = STATE_DISPENSING;
-            break;
-        }
-        // @TODO TEST CODE
     }
 
     // Turn off timer and interrupts
