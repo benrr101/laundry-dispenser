@@ -2,22 +2,22 @@
 #include <avr/interrupt.h>
 #include <avr/sleep.h>
 
-#define BTN_LED_REG_DDR  DDRA   // Register for data direction of buttons/LEDs
-#define BTN_LED_REG_PORT PORTA  // Register for setting pull-ups/output state of buttons/LEDs
-#define MTR_SNR_REG_DDR  DDRB   // Register for data direction of motor/sensor
-#define MTR_SNR_REG_PORT PORTB  // Register for setting pull-ups/output state of motor/sensor
-#define PC_REG           GPIOR0 // Register for differentiating which port gave a pin-change register
+#define BTN_LED_REG_DDR   DDRA   // Register for data direction of buttons/LEDs
+#define BTN_LED_REG_PORT  PORTA  // Register for setting pull-ups/output state of buttons/LEDs
+#define MTR_SNR_REG_DDR   DDRB   // Register for data direction of motor/sensor
+#define MTR_SNR_REG_PORT  PORTB  // Register for setting pull-ups/output state of motor/sensor
+#define PC_REG            GPIOR0 // Register for differentiating which port gave a pin-change register
 
-#define BTN_REG_PIN      PINA   // Register for reading state of buttons
-#define BTN_REG_INT      PCMSK0 // Register for button pin-change interrupts
-#define BTN_GIMSK_MSK    PCIE0  // GIMSK bit for button pin-change interrupts
-#define BTN_GIFR_FLG     PCIF0  // GIFR bit for button pin-change interrupts
-#define BTN_SIZE_PIN PORTA4
-#define BTN_SIZE_INT PCINT4
-#define BTN_ARM_PIN PORTA5
-#define BTN_ARM_INT PCINT5
-#define BTN_PURGE_PIN PORTA7
-#define BTN_PURGE_INT PCINT7
+#define BTN_REG_PIN       PINA   // Register for reading state of buttons
+#define BTN_REG_INT       PCMSK0 // Register for button pin-change interrupts
+#define BTN_GIMSK_MSK     PCIE0  // GIMSK bit for button pin-change interrupts
+#define BTN_GIFR_FLG      PCIF0  // GIFR bit for button pin-change interrupts
+#define BTN_SIZE_PIN      PORTA4
+#define BTN_SIZE_INT_MSK  PCINT4
+#define BTN_ARM_PIN       PORTA5
+#define BTN_ARM_INT_MSK   PCINT5
+#define BTN_PURGE_PIN     PORTA7
+#define BTN_PURGE_INT_MSK PCINT7
 #define BTN_MASK ((1 << BTN_SIZE_PIN) | (1 << BTN_ARM_PIN) | (1 << BTN_PURGE_PIN))
 
 #define LED_SIZE_SM_PIN PORTA0
@@ -34,51 +34,24 @@
 #define SNR_GIFR_FLG  PCIF1  // GIFR bit for button pin-change interrupts
 #define SNR_PIN       PORTB1 // Pin/port for sensor
 #define SNR_INT_MSK   PCINT9 // Pin-change interrupt mask for sensor
+#define SNR_MASK      (1 << SNR_PIN)
 
-#define TIMER_DEBOUNCE_REG_CNT TCNT0
-#define TIMER_DEBOUNCE_REG_CMP OCR0A
-#define TIMER_DEBOUNCE_REG_INT TIMSK0
-#define TIMER_DEBOUNCE_REG_FLG TIFR0
-#define TIMER_DEBOUNCE_INT_MSK OCIE0A
-#define TIMER_DEBOUNCE_INT_FLG OCF0A
-#define DEBOUNCE_TIME          40 // ~40ms debounce
+#define DEBOUNCE_TIME 40     // ~40ms @ clk/1024
+#define PURGE_DELAY   7812.5 // ~0.5s @ clk/64
 
 volatile uint8_t size = 0;
 
 #pragma region Subroutines //////////////////////////////////////////////////
-uint8_t debounce_button() {
-    // @TODO: Factor out by passing in pin register
-    uint8_t original_btn = BTN_REG_PIN & BTN_MASK;
+uint8_t debounce(volatile uint8_t* pin_register, uint8_t mask) {
+    uint8_t original_pins = *pin_register & mask;
 
-    // Run timer to debounce
-    TCCR0B |= (1 << CS00)  // Clock/1024 (bit 0)
-            | (1 << CS02); // Clock/1024 (bit 2)
-    TIMER_DEBOUNCE_REG_CMP = DEBOUNCE_TIME;                   // Set timer to go off at debounce time
-    TIMER_DEBOUNCE_REG_CNT = 0;                               // Reset timer to 0
-    TIMER_DEBOUNCE_REG_FLG |= (1 << TIMER_DEBOUNCE_INT_FLG);  // Clear existing output compare interrupt
-    TIMER_DEBOUNCE_REG_INT |= (1 << TIMER_DEBOUNCE_INT_MSK);  // Enable output compare interrupt
-
-    // Go to sleep until the timer clears
-    set_sleep_mode(SLEEP_MODE_IDLE);
-    sleep_mode();
-
-    // --- SLEEP ---
-
-    return (BTN_REG_PIN & BTN_MASK) == original_btn
-        ? ~BTN_REG_PIN & BTN_MASK
-        : 0;
-}
-
-uint8_t debounce_sensor() {
-    uint8_t original_snr = SNR_REG_PIN & (1 << SNR_PIN);
-
-    // Run timer to debounce
-    TCCR0B |= (1 << CS00)  // Clock/1024 (bit 0)
-              | (1 << CS02); // Clock/1024 (bit 2)
-    TIMER_DEBOUNCE_REG_CMP = DEBOUNCE_TIME;                   // Set timer to go off at debounce time
-    TIMER_DEBOUNCE_REG_CNT = 0;                               // Reset timer to 0
-    TIMER_DEBOUNCE_REG_FLG |= (1 << TIMER_DEBOUNCE_INT_FLG);  // Clear existing output compare interrupt
-    TIMER_DEBOUNCE_REG_INT |= (1 << TIMER_DEBOUNCE_INT_MSK);  // Enable output compare interrupt
+    // Run timer to debounce (clock/1024, normal mode)
+    TCCR0B |= (1 << CS00)    // Clock/1024 (bit 0)
+            | (1 << CS02);   // Clock/1024 (bit 2)
+    OCR0A   = DEBOUNCE_TIME; // Set timer to go off at debounce time
+    TCNT0   = 0;             // Reset timer to 0
+    TIFR0  |= (1 << OCF0A);  // Clear any existing output compare interrupt
+    TIMSK0 |= (1 << OCIE0A); // Enable output compare interrupt
 
     // Go to sleep until timer clears
     set_sleep_mode(SLEEP_MODE_IDLE);
@@ -86,10 +59,23 @@ uint8_t debounce_sensor() {
 
     // --- SLEEP ---
 
-    uint8_t current_snr = SNR_REG_PIN & (1 << SNR_PIN);
-    return current_snr == original_snr
-        ? (~SNR_REG_PIN & (1 << SNR_PIN))
-        : 0;
+    // Turn off timer
+    TCCR0A = 0;
+    TCCR0B = 0;
+
+    uint8_t current_pins = *pin_register & mask;
+    return current_pins == original_pins ? current_pins : 0;
+}
+
+uint8_t debounce_button() {
+    // Pins go low when set, so flip the debounced pin value
+    uint8_t debounced = debounce(&BTN_REG_PIN, BTN_MASK);
+    return debounced ^ BTN_MASK;
+}
+
+uint8_t debounce_sensor() {
+    // Sensor goes high when set, so debounced value is already appropriately masked
+    return debounce(&SNR_REG_PIN, SNR_MASK);
 }
 
 void set_size_leds() {
@@ -145,7 +131,7 @@ ISR(PCINT1_vect) { // Sensor pin-change ISR
 
 ISR(TIM0_COMPA_vect) { // Timer 0 output comparison A ISR
     // Disable timer 0 interrupt to prevent re-firing
-    TIMER_DEBOUNCE_REG_INT &= ~(1 << TIMER_DEBOUNCE_INT_FLG);
+    TIMSK0 = 0;
 }
 
 ISR(TIM1_COMPA_vect) { // Timer 1 output comparison A ISR
@@ -189,7 +175,7 @@ void setup() {
 }
 
 uint8_t state_setup() {
-    const uint8_t btn_ints = (1 << BTN_SIZE_INT) | (1 << BTN_ARM_INT) | (1 << BTN_PURGE_INT);
+    const uint8_t btn_ints = (1 << BTN_SIZE_INT_MSK) | (1 << BTN_ARM_INT_MSK) | (1 << BTN_PURGE_INT_MSK);
 
     uint8_t return_state = 0;
     while(return_state == 0) {
@@ -215,7 +201,7 @@ uint8_t state_setup() {
                 return_state = STATE_ARMED;
                 break;
             case (1 << BTN_PURGE_PIN):
-                // @TODO
+                return_state = STATE_PURGING;
                 break;
             default:
                 break;
@@ -229,6 +215,7 @@ uint8_t state_setup() {
 }
 
 uint8_t state_armed() {
+    // @TODO: Factor into subroutine
     // Turn on blinking blinking armed LED
     TCCR1A = (1 << WGM10)   // Fast PWM 10-bit (bit 0)
            | (1 << WGM11)   // Fast PWM 10-bit (bit 1)
@@ -240,7 +227,7 @@ uint8_t state_armed() {
                  // LED goes on
     OCR1A = 500; // Set output compare to ~500ms to toggle LED at ~50% duty cycle
 
-    const uint8_t btn_ints = (1 << BTN_ARM_INT);
+    const uint8_t btn_ints = (1 << BTN_ARM_INT_MSK);
     const uint8_t snr_ints = (1 << SNR_INT_MSK);
 
     uint8_t result_state = 0;
@@ -312,6 +299,48 @@ uint8_t state_dispensing() {
 }
 
 uint8_t state_purging() {
+    // Turn on 16-bit timer to run for 1s before beginning to dispense
+    TCCR1A  = 0;
+    TCCR1B  = (1 << CS00)    // IO clock/64 (bit 0)
+            | (1 << CS01);   // IO clock/64 (bit 1)
+    OCR1A   = 7812;          // Set output compare to ~.5s
+    TCNT1   = 0;             // Reset timer to 0
+    TIFR1  |= (1 << OCF1A);  // Clear existing output compare interrupt
+    TIMSK1 |= (1 << OCIE1A); // Enable interrupt on timer
+
+    // Turn on pin-change interrupt to see if user lets go of button
+    GIFR        |= (1 << BTN_GIFR_FLG);
+    BTN_REG_INT |= (1 << BTN_PURGE_INT_MSK);
+
+    // Go to sleep
+    sei();
+    sleep_mode();
+
+    // --- SLEEP ---
+
+    // Awoken by pin-change or timer
+    if (BTN_REG_PIN & (1 << BTN_PURGE_PIN)) {
+        // Button has been released
+    } else {
+        // Timer elapsed - begin purging
+        MTR_SNR_REG_PORT |= (1 << MTR_PIN);
+        BTN_LED_REG_PORT |= (1 << LED_ARMED_PIN);
+
+        // Go to sleep until button is released
+        sei();
+        sleep_mode();
+
+        // --- SLEEP ---
+
+        // Awoken by pin-change
+        MTR_SNR_REG_PORT &= ~(1 << MTR_PIN);
+        BTN_LED_REG_PORT &= ~(1 << LED_ARMED_PIN);
+    }
+
+    // Turn off timer
+    TCCR0A = 0;
+    TCCR0B = 0;
+
     return STATE_SETUP;
 }
 
